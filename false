@@ -1,0 +1,64 @@
+===== 今日清单  2026-06-11 星期四 =====
+来源文件 (3 个, 13 条去重后):
+  · D:\TraeProjects\1023\test_ws4\project_alpha\TODO.md  (5 条)
+  · D:\TraeProjects\1023\test_ws4\project_beta\todo.md  (2 条)
+  · D:\TraeProjects\1023\test_ws4\todo.txt  (6 条)
+
+⚠ 过期事项:
+  1. [过期] 2025-01-15 过去的任务  (todo.txt)
+
+📋 待办事项:
+  1. [待办] # Project Alpha  (TODO.md)
+  2. [待办] - [ ] alpha 待办 1  (TODO.md)
+  3. [待办] * [ ] alpha 待办 2  (TODO.md)
+  4. [待办] - [ ] 子任务忽略  (TODO.md)
+  5. [待办] - [ ] 工作区待办任务 A  (todo.txt)
+  6. [待办] * [ ] 工作区待办任务 B  (todo.txt)
+  7. [计划] 2099-12-31 未来的任务  (todo.txt)
+
+✅ 已完成:
+  · alpha 已完成  (TODO.md)
+  · beta 全完成 1  (todo.md)
+  · beta 全完成 2  (todo.md)
+  · 已完成的公共任务  (todo.txt)
+  · 工作区已完成任务  (todo.txt)
+
+统计: 待办 7  过期 1  完成 5
+
+── 按项目关键词分组 ──
+
+## 项目: Project
+  · [待办] # Project Alpha  (TODO.md)
+
+## 项目: alpha
+  · [已完成] alpha 已完成  (TODO.md)
+  · [待办] - [ ] alpha 待办 1  (TODO.md)
+  · [待办] * [ ] alpha 待办 2  (TODO.md)
+
+## 项目: beta
+  · [已完成] beta 全完成 1  (todo.md)
+  · [已完成] beta 全完成 2  (todo.md)
+
+## 项目: 子任务忽略
+  · [待办] - [ ] 子任务忽略  (TODO.md)
+
+## 项目: 工作区已完成任务
+  · [已完成] 工作区已完成任务  (todo.txt)
+
+## 项目: 工作区待办任务
+  · [待办] - [ ] 工作区待办任务 A  (todo.txt)
+  · [待办] * [ ] 工作区待办任务 B  (todo.txt)
+
+## 项目: 已完成的公共任务
+  · [已完成] 已完成的公共任务  (todo.txt)
+
+## 项目: 未来的任务
+  · [计划] 2099-12-31 未来的任务  (todo.txt)
+
+## 项目: 过去的任务
+  · [过期] 2025-01-15 过去的任务  (todo.txt)
+
+── 周报摘要 ──
+
+长期过期项目 (1 个):
+  · 过去的任务

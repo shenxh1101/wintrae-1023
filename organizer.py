@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 LOCK_SENTINEL = ".lock"
 UNDO_LOG = Path.home() / ".organizer_undo.json"
 SCHEMES_FILE = Path.home() / ".organizer_schemes.json"
+ARCHIVE_INDEX = Path.home() / ".organizer_archive_index.json"
 WORKSPACE_CONFIG = ".organizer.json"
 REPORT_FILE = "organizer_report.txt"
 MARKER_DONE = {".done", ".completed", "DONE.md", "COMPLETED.md", "done.txt", "completed.txt"}
@@ -139,6 +140,28 @@ def _find_duplicate_in_dir(src: Path, dest_dir: Path) -> Optional[Path]:
     return None
 
 
+def _line_is_done(line: str) -> bool:
+    s = line.strip().lower()
+    if not s:
+        return False
+    if re.match(r"^[-*]\s*\[[x\*]\]", s):
+        return True
+    if s.startswith(("x ", "✓ ", "✔ ", "[x] ", "[done] ", "[*] ")):
+        return True
+    return False
+
+
+def _line_is_list_item(line: str) -> bool:
+    s = line.strip().lower()
+    if not s:
+        return False
+    if re.match(r"^[-*]\s*(\[|)", s):
+        return True
+    if s.startswith(("x ", "✓ ", "✔ ", "[", "[x] ", "[done] ")):
+        return True
+    return False
+
+
 def _project_is_completed(p: Path) -> Tuple[bool, str]:
     for marker in MARKER_DONE:
         if (p / marker).exists():
@@ -147,25 +170,15 @@ def _project_is_completed(p: Path) -> Tuple[bool, str]:
         todo = p / todo_name
         if todo.exists():
             try:
-                text = todo.read_text(encoding="utf-8", errors="ignore")
+                text = todo.read_text(encoding="utf-8-sig", errors="ignore")
                 raw_lines = [l for l in text.splitlines() if l.strip()]
                 if not raw_lines:
                     continue
-                list_lines = [
-                    l for l in raw_lines
-                    if l.strip().startswith(("-", "*", "[", "x ", "✓ ", "✔ ", "X "))
-                ]
+                list_lines = [l for l in raw_lines if _line_is_list_item(l)]
                 if not list_lines:
                     continue
-                done_lines = [
-                    l for l in list_lines
-                    if l.strip().lower().startswith(("x ", "✓ ", "✔ ", "[x] ", "[done]", "- [x]"))
-                ]
-                pending_lines = [
-                    l for l in list_lines
-                    if l.strip().startswith(("-", "*", "["))
-                    and not l.strip().lower().startswith(("x ", "✓ ", "✔ ", "[x] ", "[done]", "- [x]"))
-                ]
+                done_lines = [l for l in list_lines if _line_is_done(l)]
+                pending_lines = [l for l in list_lines if not _line_is_done(l)]
                 total = len(done_lines) + len(pending_lines)
                 if len(done_lines) > 0 and len(pending_lines) == 0:
                     return True, f"清单全部完成 ({len(done_lines)}/{total})"
@@ -272,6 +285,35 @@ def _load_schemes() -> Dict[str, dict]:
 
 def _save_schemes(schemes: Dict[str, dict]) -> None:
     SCHEMES_FILE.write_text(json.dumps(schemes, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _load_archive_index() -> List[dict]:
+    if ARCHIVE_INDEX.exists():
+        return json.loads(ARCHIVE_INDEX.read_text(encoding="utf-8-sig"))
+    return []
+
+
+def _save_archive_index(entries: List[dict]) -> None:
+    ARCHIVE_INDEX.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _add_archive_entry(project_name: str, workspace: str, zip_path: str,
+                       completed_reason: str = "", expired_files: int = 0,
+                       total_files: int = 0) -> None:
+    entries = _load_archive_index()
+    entry = {
+        "timestamp": datetime.datetime.now().isoformat(),
+        "project": project_name,
+        "workspace": workspace,
+        "zip_path": zip_path,
+        "completed_reason": completed_reason,
+        "expired_files": expired_files,
+        "total_files": total_files,
+    }
+    entries.append(entry)
+    if len(entries) > 500:
+        entries = entries[-500:]
+    _save_archive_index(entries)
 
 
 # ──────────────────────────── reporting ────────────────────────────
@@ -792,12 +834,70 @@ def _extract_keywords(text: str, aliases: Dict[str, str] = None) -> List[str]:
             result.append(resolved)
     return result
 
-def cmd_agenda(args) -> None:
-    todo_file = Path(args.todo_file).resolve()
-    if not todo_file.is_file():
-        print(f"[错误] {todo_file} 不存在"); return
 
-    config = _load_workspace_config(todo_file.parent)
+def _find_todo_files(root: Path, lock_dirs: List[str] = None) -> List[Path]:
+    lock_dirs = lock_dirs or []
+    todo_names = {"todo.txt", "todo.md", "TODO.md", "TODO.txt", "todos.md", "TODOS.md"}
+    results: List[Path] = []
+
+    def _walk(p: Path) -> None:
+        try:
+            if _is_locked(p, lock_dirs):
+                return
+            for entry in p.iterdir():
+                if entry.is_file() and entry.name.lower() in todo_names:
+                    results.append(entry)
+                elif entry.is_dir() and not entry.name.startswith("_") and entry.name not in SORT_DIR_NAMES:
+                    _walk(entry)
+        except (PermissionError, OSError):
+            pass
+
+    _walk(root)
+    return sorted(results)
+
+
+def _normalize_todo_text(text: str) -> str:
+    text = text.strip().lower()
+    text = re.sub(r"^\s*[-*]\s*(\[[ x*]\]\s*)?", "", text)
+    text = re.sub(r"^\s*[x✓✔]\s+", "", text)
+    text = re.sub(r"#\w+", "", text)
+    text = re.sub(r"\d{4}-\d{2}-\d{2}", "", text)
+    text = re.sub(r"\s+", "", text)
+    return text
+
+
+def cmd_agenda(args) -> None:
+    todo_files: List[Path] = []
+
+    positional = Path(args.todo_file).resolve()
+    if positional.is_file():
+        todo_files.append(positional)
+        config_base = positional.parent
+    elif positional.is_dir():
+        found = _find_todo_files(positional, args.lock_dir or [])
+        todo_files.extend(found)
+        config_base = positional
+    else:
+        print(f"[错误] {positional} 不存在"); return
+
+    if getattr(args, "file", None):
+        for f in args.file:
+            fp = Path(f).resolve()
+            if fp.is_file() and fp not in todo_files:
+                todo_files.append(fp)
+
+    if getattr(args, "workspace_agenda", None):
+        ws = Path(args.workspace_agenda).resolve()
+        if ws.is_dir():
+            found = _find_todo_files(ws, args.lock_dir or [])
+            for fp in found:
+                if fp not in todo_files:
+                    todo_files.append(fp)
+
+    if not todo_files:
+        print("[错误] 未找到任何待办文件"); return
+
+    config = _load_workspace_config(config_base)
     _apply_config(args, config)
 
     if args.project_dir:
@@ -810,96 +910,127 @@ def cmd_agenda(args) -> None:
     today_str = today.strftime("%Y-%m-%d")
     weekday_cn = ["一", "二", "三", "四", "五", "六", "日"][today.weekday()]
 
-    lines = todo_file.read_text(encoding="utf-8").splitlines()
-    report: List[str] = []
-    _report_line(report, f"===== 今日清单  {today_str} 星期{weekday_cn} =====")
-    _report_line(report, "")
-
-    done_items: List[str] = []
-    todo_items: List[str] = []
-    due_items: List[str] = []
-    project_groups: Dict[str, List[Dict]] = {}
+    all_items: List[dict] = []
+    seen_normalized: Dict[str, dict] = {}
+    source_counts: Dict[str, int] = {}
 
     date_re = re.compile(r"(\d{4}-\d{2}-\d{2})")
 
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
+    for tf in todo_files:
+        try:
+            lines = tf.read_text(encoding="utf-8-sig").splitlines()
+        except Exception:
             continue
+        src = str(tf)
+        source_counts[src] = 0
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
 
-        is_done = stripped.lower().startswith(("x ", "✓ ", "✔ ", "[x] ", "[done]", "- [x]"))
-        clean = re.sub(r"^(x\s+|✓\s+|✔\s+|\[x\]\s+|\[done\]\s*|-\s*\[x\]\s+)", "", stripped, flags=re.IGNORECASE)
-        tags = _extract_tags(stripped)
-        keywords = _extract_keywords(clean, aliases)
+            norm = _normalize_todo_text(stripped)
+            if not norm:
+                continue
 
-        group = None
-        for t in tags:
-            if t in aliases:
-                group = aliases[t]
-                break
-            resolved = aliases.get(t, aliases.get(t.lower()))
-            if resolved:
-                group = resolved
-                break
-        if group is None:
-            for k in keywords:
-                if k in aliases:
-                    group = aliases[k]
+            is_done = _line_is_done(stripped)
+            clean = re.sub(r"^(x\s+|✓\s+|✔\s+|\[x\]\s+|\[done\]\s*|-\s*\[x\]\s+|\*\s*\[x\]\s+)",
+                            "", stripped, flags=re.IGNORECASE)
+            tags = _extract_tags(stripped)
+            keywords = _extract_keywords(clean, aliases)
+
+            group = None
+            for t in tags:
+                if t in aliases:
+                    group = aliases[t]
                     break
-            else:
-                group = keywords[0] if keywords else "未分类"
+                resolved = aliases.get(t, aliases.get(t.lower()))
+                if resolved:
+                    group = resolved
+                    break
+            if group is None:
+                for k in keywords:
+                    if k in aliases:
+                        group = aliases[k]
+                        break
+                else:
+                    group = keywords[0] if keywords else "未分类"
 
-        m = date_re.search(stripped)
-        item_info = {"text": clean, "tags": tags, "keywords": keywords}
+            m = date_re.search(stripped)
+            status = "待办"
+            if is_done:
+                status = "已完成"
+            elif m:
+                td = m.group(1)
+                if td < today_str:
+                    status = "过期"
+                elif td == today_str:
+                    status = "今日"
+                else:
+                    status = "计划"
 
-        if m:
-            task_date = m.group(1)
-            if is_done:
-                done_items.append(stripped)
-                item_info["status"] = "已完成"
-                project_groups.setdefault(group, []).append(item_info)
-            elif task_date < today_str:
-                due_items.append(f"[过期] {stripped}")
-                item_info["status"] = "过期"
-                project_groups.setdefault(group, []).append(item_info)
-            elif task_date == today_str:
-                todo_items.append(f"[今日] {stripped}")
-                item_info["status"] = "今日"
-                project_groups.setdefault(group, []).append(item_info)
+            item_info = {
+                "text": clean,
+                "tags": tags,
+                "keywords": keywords,
+                "status": status,
+                "source": src,
+                "raw": stripped,
+            }
+
+            if norm in seen_normalized:
+                prev = seen_normalized[norm]
+                if src not in prev["sources"]:
+                    prev["sources"].append(src)
             else:
-                todo_items.append(f"[计划] {stripped}")
-                item_info["status"] = "计划"
-                project_groups.setdefault(group, []).append(item_info)
-        else:
-            if is_done:
-                done_items.append(stripped)
-                item_info["status"] = "已完成"
-                project_groups.setdefault(group, []).append(item_info)
-            else:
-                todo_items.append(f"[待办] {stripped}")
-                item_info["status"] = "待办"
-                project_groups.setdefault(group, []).append(item_info)
+                item_info["sources"] = [src]
+                seen_normalized[norm] = item_info
+                all_items.append(item_info)
+                source_counts[src] = source_counts.get(src, 0) + 1
+
+    report: List[str] = []
+    multi_source = len(todo_files) > 1
+    _report_line(report, f"===== 今日清单  {today_str} 星期{weekday_cn} =====")
+
+    if multi_source:
+        _report_line(report, f"来源文件 ({len(todo_files)} 个, {len(all_items)} 条去重后):")
+        for tf in todo_files:
+            cnt = source_counts.get(str(tf), 0)
+            _report_line(report, f"  · {tf}  ({cnt} 条)")
+
+    due_items = [it for it in all_items if it["status"] == "过期"]
+    todo_items = [it for it in all_items if it["status"] in ("今日", "计划", "待办")]
+    done_items = [it for it in all_items if it["status"] == "已完成"]
+
+    _report_line(report, "")
 
     if due_items:
         _report_line(report, "⚠ 过期事项:")
-        for i, item in enumerate(due_items, 1):
-            _report_line(report, f"  {i}. {item}")
+        for i, it in enumerate(due_items, 1):
+            src_tag = f"  ({Path(it['sources'][0]).name})" if multi_source else ""
+            _report_line(report, f"  {i}. [{it['status']}] {it['text']}{src_tag}")
         _report_line(report, "")
 
     _report_line(report, "📋 待办事项:")
-    for i, item in enumerate(todo_items, 1):
-        _report_line(report, f"  {i}. {item}")
+    for i, it in enumerate(todo_items, 1):
+        src_tag = f"  ({Path(it['sources'][0]).name})" if multi_source else ""
+        _report_line(report, f"  {i}. [{it['status']}] {it['text']}{src_tag}")
 
     if done_items:
         _report_line(report, "")
         _report_line(report, "✅ 已完成:")
-        for item in done_items:
-            _report_line(report, f"  · {item}")
+        for it in done_items:
+            src_tag = f"  ({Path(it['sources'][0]).name})" if multi_source else ""
+            _report_line(report, f"  · {it['text']}{src_tag}")
 
     _report_line(report, "")
     _report_line(report, f"统计: 待办 {len(todo_items)}  过期 {len(due_items)}  完成 {len(done_items)}")
 
-    show_groups = bool(args.project_dir) or bool(aliases) or len(project_groups) > 0
+    project_groups: Dict[str, List[dict]] = {}
+    for it in all_items:
+        group = it["keywords"][0] if it["keywords"] else "未分类"
+        project_groups.setdefault(group, []).append(it)
+
+    show_groups = bool(args.project_dir) or bool(aliases) or len(project_groups) > 1
 
     if show_groups:
         proj_root = Path(args.project_dir).resolve() if args.project_dir else None
@@ -955,11 +1086,13 @@ def cmd_agenda(args) -> None:
 
         for group, items in sorted(project_groups.items()):
             _report_line(report, f"\n## 项目: {group}")
-            for item_info in items:
-                tag_str = " ".join(f"#{t}" for t in item_info.get("tags", []))
-                line = f"  · [{item_info['status']}] {item_info['text']}"
+            for it in items:
+                tag_str = " ".join(f"#{t}" for t in it.get("tags", []))
+                src_tag = f"  ({Path(it['sources'][0]).name})" if multi_source else ""
+                line = f"  · [{it['status']}] {it['text']}"
                 if tag_str:
                     line += f"  {tag_str}"
+                line += src_tag
                 _report_line(report, line)
 
             if proj_root:
@@ -1090,6 +1223,7 @@ def cmd_archive(args) -> None:
 
         if to_archive:
             _report_line(report, f"\n打包归档:")
+            archived_projects: List[dict] = []
             for pd, completed, reason in to_archive:
                 zip_name = f"{pd.name}_{datetime.datetime.now():%Y%m%d}.zip"
                 zip_path = archive_dir / zip_name
@@ -1099,6 +1233,7 @@ def cmd_archive(args) -> None:
                 detail = f"完成: {reason}" if completed else "未完成 (--zip-all)"
                 _report_line(report, f"  {pd.name}  ->  {zip_path}  ({detail})")
                 ops.append({"op": "archive_zip", "src": str(pd), "dst": str(zip_path)})
+                file_count = 0
                 if not args.preview:
                     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
                         for root, _, files in os.walk(pd):
@@ -1107,8 +1242,43 @@ def cmd_archive(args) -> None:
                                 try:
                                     arcname = str(fp.relative_to(pd.parent))
                                     zf.write(fp, arcname)
+                                    file_count += 1
                                 except Exception:
                                     pass
+                    archived_projects.append({
+                        "project": pd.name,
+                        "zip_path": str(zip_path),
+                        "completed_reason": reason if completed else "未完成 (--zip-all 强制)",
+                        "total_files": file_count,
+                    })
+                    _add_archive_entry(
+                        project_name=pd.name,
+                        workspace=str(folder),
+                        zip_path=str(zip_path),
+                        completed_reason=reason if completed else "未完成 (--zip-all 强制)",
+                        total_files=file_count,
+                    )
+                else:
+                    cnt = sum(len(files) for _, _, files in os.walk(pd))
+                    archived_projects.append({
+                        "project": pd.name,
+                        "zip_path": str(zip_path),
+                        "completed_reason": reason if completed else "未完成 (--zip-all 强制)",
+                        "total_files": cnt,
+                    })
+
+            if not args.preview and archived_projects:
+                local_idx = archive_dir / "index.json"
+                existing = []
+                if local_idx.exists():
+                    try:
+                        existing = json.loads(local_idx.read_text(encoding="utf-8-sig"))
+                    except Exception:
+                        existing = []
+                ts = datetime.datetime.now().isoformat()
+                for ap in archived_projects:
+                    existing.append({**ap, "timestamp": ts, "expired_files": len(expired)})
+                local_idx.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
     else:
         for pd, completed, reason in project_dirs:
             _report_line(report, f"  [跳过] {pd.name}  原因: 未使用 --zip 或 --zip-all")
@@ -1300,6 +1470,32 @@ def cmd_status(args) -> None:
     else:
         print(f"\n(未找到最近的报告文件)")
 
+    archive_entries = _load_archive_index()
+    if archive_entries:
+        by_workspace: Dict[str, List[dict]] = {}
+        for e in archive_entries[-50:]:
+            ws = e.get("workspace", "未知")
+            by_workspace.setdefault(ws, []).append(e)
+
+        print(f"\n归档历史 (共 {len(archive_entries)} 条):")
+        for ws, entries in sorted(by_workspace.items()):
+            print(f"\n工作区: {ws}")
+            for e in reversed(entries[-10:]):
+                ts = e.get("timestamp", "?")[:19]
+                proj = e.get("project", "?")
+                reason = e.get("completed_reason", "")
+                fc = e.get("total_files", 0)
+                zp = e.get("zip_path", "")
+                label = f"  [{ts}] {proj}"
+                if reason:
+                    label += f"  ({reason})"
+                label += f"  {fc} 个文件"
+                print(label)
+                if zp:
+                    print(f"     zip: {zp}")
+    else:
+        print(f"\n(暂无归档记录)")
+
 
 # ──────────────────────────── config ────────────────────────────
 
@@ -1321,6 +1517,49 @@ def cmd_config(args) -> None:
         }
         _save_workspace_config(folder, config)
         print(f"已初始化工作区配置: {cfg_path}")
+        return
+
+    if args.validate:
+        if not cfg_path.is_file():
+            print(f"[错误] 工作区无配置文件: {cfg_path}"); return
+        config = _load_workspace_config(folder)
+        issues: List[Dict] = []
+
+        report_path = config.get("report_path", "")
+        if report_path:
+            rp = Path(report_path)
+            if not rp.is_absolute():
+                rp = folder / rp
+            if not rp.exists():
+                issues.append({"类型": "报告目录", "键": "report_path", "值": report_path, "问题": "路径不存在"})
+
+        lock_dirs = config.get("lock_dirs", []) or []
+        for i, ld in enumerate(lock_dirs):
+            lp = Path(ld)
+            if not lp.is_absolute():
+                lp = folder / lp
+            if not lp.exists():
+                issues.append({"类型": "锁定目录", "键": f"lock_dirs[{i}]", "值": ld, "问题": "目录不存在"})
+
+        aliases = config.get("aliases", {}) or {}
+        for alias, target in aliases.items():
+            if isinstance(target, str) and ("/" in target or "\\" in target):
+                tp = Path(target)
+                if not tp.is_absolute():
+                    tp = folder / tp
+                if not tp.exists():
+                    issues.append({"类型": "别名指向", "键": f"aliases.{alias}", "值": target, "问题": "指向路径不存在"})
+
+        print(f"===== 配置校验  {cfg_path} =====")
+        if not issues:
+            print("✅ 所有配置项均有效，未发现失效路径")
+        else:
+            print(f"⚠ 发现 {len(issues)} 个失效项:\n")
+            for iss in issues:
+                print(f"  [{iss['类型']}] {iss['键']}")
+                print(f"    值: {iss['值']}")
+                print(f"    问题: {iss['问题']}")
+                print()
         return
 
     if args.show or (not args.set_key and not args.set_alias and not args.remove_key):
@@ -1409,7 +1648,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     # agenda
     s_agenda = sub.add_parser("agenda", help="读取待办文本生成今日清单，支持按项目分组")
-    s_agenda.add_argument("todo_file", help="待办文本文件路径 (todo.txt)")
+    s_agenda.add_argument("todo_file", help="待办文件或工作区目录 (自动扫描 todo 文件)")
+    s_agenda.add_argument("--file", action="append", default=[], help="额外的待办文件路径 (可重复)")
+    s_agenda.add_argument("--workspace", dest="workspace_agenda", help="从工作区递归扫描所有 todo 文件并合并")
     s_agenda.add_argument("--project-dir", help="扫描项目素材目录，自动关联待办")
     s_agenda.add_argument("--lock-dir", action="append", default=[], help="手动锁定目录")
     s_agenda.add_argument("--markdown", action="store_true", help="报告导出为 Markdown")
@@ -1438,6 +1679,7 @@ def build_parser() -> argparse.ArgumentParser:
     s_config.add_argument("folder", help="工作区目录路径")
     s_config.add_argument("--init", action="store_true", help="初始化工作区配置文件")
     s_config.add_argument("--show", action="store_true", help="显示当前配置")
+    s_config.add_argument("--validate", action="store_true", help="校验配置中的路径是否有效")
     s_config.add_argument("--set", dest="set_key", action="append", help="设置配置键值 (key=value)")
     s_config.add_argument("--set-alias", action="append", help="设置项目别名 (alias=target)")
     s_config.add_argument("--remove", dest="remove_key", action="append", help="移除配置键")

@@ -1,0 +1,16 @@
+===== 归档报告  2026-06-11 02:52 =====
+过期阈值: 0 天 (早于 2026-06-11)
+归档模式: --zip (仅确认完成的项目，如需全部打包请用 --zip-all)
+
+过期文件 (1):
+  2026-06-11  todo.txt
+
+项目目录评估 (2 个):
+  [跳过] project_alpha  原因: 未完成
+  [归档] project_beta  原因: 完成: 清单全部完成 (2/2)
+
+打包归档:
+  project_beta  ->  D:\TraeProjects\1023\test_ws4\_archive\project_beta_20260611.zip  (完成: 清单全部完成 (2/2))
+
+移动过期文件到 _archive/:
+  todo.txt  ->  D:\TraeProjects\1023\test_ws4\_archive\todo.txt
