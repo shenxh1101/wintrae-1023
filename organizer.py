@@ -148,20 +148,29 @@ def _project_is_completed(p: Path) -> Tuple[bool, str]:
         if todo.exists():
             try:
                 text = todo.read_text(encoding="utf-8", errors="ignore")
-                lines = [l for l in text.splitlines() if l.strip()]
-                if not lines:
+                raw_lines = [l for l in text.splitlines() if l.strip()]
+                if not raw_lines:
+                    continue
+                list_lines = [
+                    l for l in raw_lines
+                    if l.strip().startswith(("-", "*", "[", "x ", "✓ ", "✔ ", "X "))
+                ]
+                if not list_lines:
                     continue
                 done_lines = [
-                    l for l in lines
+                    l for l in list_lines
                     if l.strip().lower().startswith(("x ", "✓ ", "✔ ", "[x] ", "[done]", "- [x]"))
                 ]
                 pending_lines = [
-                    l for l in lines
-                    if l.strip().startswith("-") or l.strip().startswith("*") or l.strip().startswith("[")
+                    l for l in list_lines
+                    if l.strip().startswith(("-", "*", "["))
                     and not l.strip().lower().startswith(("x ", "✓ ", "✔ ", "[x] ", "[done]", "- [x]"))
                 ]
+                total = len(done_lines) + len(pending_lines)
+                if len(done_lines) > 0 and len(pending_lines) == 0:
+                    return True, f"清单全部完成 ({len(done_lines)}/{total})"
                 if pending_lines and len(done_lines) >= len(pending_lines):
-                    return True, f"清单完成度高 ({len(done_lines)}/{len(done_lines) + len(pending_lines)})"
+                    return True, f"清单完成度高 ({len(done_lines)}/{total})"
             except Exception:
                 pass
     return False, ""
@@ -192,7 +201,7 @@ def _load_workspace_config(folder: Path) -> dict:
         return {}
     cfg_path = ws_root / WORKSPACE_CONFIG
     try:
-        return json.loads(cfg_path.read_text(encoding="utf-8"))
+        return json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     except Exception:
         return {}
 
@@ -330,7 +339,7 @@ def cmd_scan(args) -> None:
     _report_line(report, f"===== 扫描报告  {datetime.datetime.now():%Y-%m-%d %H:%M} =====")
     _report_line(report, f"目标目录: {folder}")
 
-    days_expired = getattr(args, "expire_days", 30)
+    days_expired = args.expire_days if args.expire_days is not None else 30
     cutoff = datetime.datetime.now() - datetime.timedelta(days=days_expired)
     aliases: Dict[str, str] = getattr(args, "_config_aliases", {})
 
@@ -473,17 +482,43 @@ def _apply_rename_scheme(fp: Path, scheme: dict) -> Optional[Tuple[str, str]]:
     return new_name, new_stem
 
 
-def _resolve_rename_conflict(fp: Path, new_name: str) -> Path:
-    new_path = fp.parent / new_name
-    if not new_path.exists() or new_path.resolve() == fp.resolve():
-        return new_path
-    base_stem = new_path.stem
-    counter = 1
-    while True:
-        candidate = fp.parent / f"{base_stem}_{counter}{fp.suffix}"
-        if not candidate.exists() or candidate.resolve() == fp.resolve():
-            return candidate
-        counter += 1
+def _batch_resolve_rename_conflicts(plans: List[Tuple[Path, str]]) -> List[Tuple[Path, str, Path]]:
+    plans_sorted = sorted(plans, key=lambda x: (str(x[0].parent).lower(), x[1].lower(), x[0].name.lower()))
+
+    per_dir_real: Dict[str, set] = {}
+    for fp, _ideal in plans_sorted:
+        key = str(fp.parent.resolve()).lower()
+        if key not in per_dir_real:
+            per_dir_real[key] = set()
+            for child in fp.parent.iterdir():
+                if child.is_file():
+                    per_dir_real[key].add(child.name.lower())
+
+    planned_names: Dict[str, set] = {}
+    result: List[Tuple[Path, str, Path]] = []
+
+    for fp, ideal_name in plans_sorted:
+        key = str(fp.parent.resolve()).lower()
+        occupied_lower = per_dir_real.get(key, set()) | planned_names.get(key, set())
+
+        if ideal_name.lower() in occupied_lower:
+            stem = Path(ideal_name).stem
+            suffix = fp.suffix
+            counter = 1
+            while True:
+                candidate = f"{stem}_{counter}{suffix}"
+                if candidate.lower() not in occupied_lower:
+                    final_name = candidate
+                    break
+                counter += 1
+        else:
+            final_name = ideal_name
+
+        final_path = fp.parent / final_name
+        result.append((fp, ideal_name, final_path))
+        planned_names.setdefault(key, set()).add(final_name.lower())
+
+    return result
 
 
 def cmd_rename(args) -> None:
@@ -541,7 +576,7 @@ def cmd_rename(args) -> None:
     _report_line(report, f"  关键词: {scheme.get('keyword') or '(无)'}")
     _report_line(report, f"  模板: {scheme.get('pattern') or '(默认 日期_关键词_原名)'}")
 
-    resolved_plans: List[Tuple[Path, str, Path]] = []
+    raw_plans: List[Tuple[Path, str]] = []
 
     for root, dirs, files in os.walk(folder):
         rp = Path(root)
@@ -557,10 +592,14 @@ def cmd_rename(args) -> None:
             if result is None:
                 continue
             new_name, _new_stem = result
-            final_path = _resolve_rename_conflict(fp, new_name)
-            if final_path.resolve() == fp.resolve():
-                continue
-            resolved_plans.append((fp, new_name, final_path))
+            try:
+                if (fp.parent / new_name).resolve() == fp.resolve():
+                    continue
+            except Exception:
+                pass
+            raw_plans.append((fp, new_name))
+
+    resolved_plans = _batch_resolve_rename_conflicts(raw_plans)
 
     conflicts = [(fp, ideal, final) for fp, ideal, final in resolved_plans if final.name != ideal]
     clean_plans = [(fp, ideal, final) for fp, ideal, final in resolved_plans if final.name == ideal]
@@ -741,21 +780,29 @@ def _extract_keywords(text: str, aliases: Dict[str, str] = None) -> List[str]:
     for k in kws:
         if k.lower() in stop or len(k) < 2:
             continue
-        resolved = aliases.get(k, aliases.get(k.lower(), k))
+        resolved = aliases.get(k, aliases.get(k.lower()))
+        if resolved is None:
+            for alias_val in aliases.values():
+                if k.lower() in alias_val.lower() or alias_val.lower() in k.lower():
+                    resolved = alias_val
+                    break
+        if resolved is None:
+            resolved = k
         if resolved not in result:
             result.append(resolved)
     return result
-
 
 def cmd_agenda(args) -> None:
     todo_file = Path(args.todo_file).resolve()
     if not todo_file.is_file():
         print(f"[错误] {todo_file} 不存在"); return
 
-    config = {}
-    if args.project_dir:
-        config = _load_workspace_config(Path(args.project_dir))
+    config = _load_workspace_config(todo_file.parent)
     _apply_config(args, config)
+
+    if args.project_dir:
+        pd_config = _load_workspace_config(Path(args.project_dir))
+        _apply_config(args, pd_config)
 
     aliases: Dict[str, str] = getattr(args, "_config_aliases", {})
 
@@ -790,11 +837,17 @@ def cmd_agenda(args) -> None:
             if t in aliases:
                 group = aliases[t]
                 break
-            if t.lower() in [k.lower() for k in keywords]:
-                group = aliases.get(t, t)
+            resolved = aliases.get(t, aliases.get(t.lower()))
+            if resolved:
+                group = resolved
                 break
         if group is None:
-            group = keywords[0] if keywords else "未分类"
+            for k in keywords:
+                if k in aliases:
+                    group = aliases[k]
+                    break
+            else:
+                group = keywords[0] if keywords else "未分类"
 
         m = date_re.search(stripped)
         item_info = {"text": clean, "tags": tags, "keywords": keywords}
@@ -846,14 +899,16 @@ def cmd_agenda(args) -> None:
     _report_line(report, "")
     _report_line(report, f"统计: 待办 {len(todo_items)}  过期 {len(due_items)}  完成 {len(done_items)}")
 
-    if args.project_dir:
-        proj_root = Path(args.project_dir).resolve()
+    show_groups = bool(args.project_dir) or bool(aliases) or len(project_groups) > 0
+
+    if show_groups:
+        proj_root = Path(args.project_dir).resolve() if args.project_dir else None
         _report_line(report, "")
-        _report_line(report, "── 按项目关键词分组 + 关联素材 ──")
+        _report_line(report, "── 按项目关键词分组" + (" + 关联素材" if proj_root else "") + " ──")
 
         file_index: Dict[str, List[str]] = {}
         dir_name_index: Dict[str, List[str]] = {}
-        if proj_root.is_dir():
+        if proj_root and proj_root.is_dir():
             for entry in sorted(proj_root.iterdir()):
                 if entry.is_dir() and not entry.name.startswith("_") and entry.name not in SORT_DIR_NAMES:
                     if not _is_locked(entry, args.lock_dir or []):
@@ -907,23 +962,26 @@ def cmd_agenda(args) -> None:
                     line += f"  {tag_str}"
                 _report_line(report, line)
 
-            related = _find_related_files(group)
-            if related:
-                _report_line(report, f"  📎 相关素材 ({len(related)}):")
-                for rf in related[:10]:
-                    _report_line(report, f"      {rf}")
-                if len(related) > 10:
-                    _report_line(report, f"      ... 其余 {len(related) - 10} 个省略")
+            if proj_root:
+                related = _find_related_files(group)
+                if related:
+                    _report_line(report, f"  📎 相关素材 ({len(related)}):")
+                    for rf in related[:10]:
+                        _report_line(report, f"      {rf}")
+                    if len(related) > 10:
+                        _report_line(report, f"      ... 其余 {len(related) - 10} 个省略")
 
         orphaned_materials: List[Tuple[str, int]] = []
-        for kw_lower, files in file_index.items():
-            if kw_lower not in todo_keywords_set:
-                orphaned_materials.append((kw_lower, len(files)))
+        if proj_root:
+            for kw_lower, files in file_index.items():
+                if kw_lower not in todo_keywords_set:
+                    orphaned_materials.append((kw_lower, len(files)))
 
         orphaned_todos: List[str] = []
-        for group in project_groups:
-            if not _find_related_files(group) and group != "未分类":
-                orphaned_todos.append(group)
+        if proj_root:
+            for group in project_groups:
+                if not _find_related_files(group) and group != "未分类":
+                    orphaned_todos.append(group)
 
         long_expired_projects: List[str] = []
         for group, items in project_groups.items():
@@ -961,7 +1019,7 @@ def cmd_archive(args) -> None:
     config = _load_workspace_config(folder)
     _apply_config(args, config)
 
-    days = args.days
+    days = args.days if args.days is not None else 30
     cutoff = datetime.datetime.now() - datetime.timedelta(days=days)
     zip_mode = getattr(args, "zip", False)
     zip_all = getattr(args, "zip_all", False)
